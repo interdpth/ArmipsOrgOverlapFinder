@@ -1,2 +1,25 @@
 # ArmipsOrgOverlapFinder
-ArmipsOrgOverlapFinder is a powerful utility for detecting overlapping .org memory regions in Armips assembly projects. It recursively scans .asm, .s, and .inc files across multiple directories, follows .include directives, evaluates symbols and expressions, and heuristically resolves .org addresses. Designed for retro game hacking, ROM development, and embedded projects, it helps catch memory collisions early, ensuring clean, conflict-free builds.  Key Features:  Fully compatible with Armips syntax.  Recursive scan of multiple directories, following .include directives.  Builds symbol tables from NAME equ EXPR (supports hex $NN, 0xNN, trailing h).  Evaluates expressions with + and - using symbols.  Resolves .org directives numerically, symbolically, or via heuristic estimation.  Detects overlaps between regions across directories with configurable tolerance.  Reports unresolved labels and provides hints for manual resolution.  Typical Use Case: Detect memory layout conflicts when combining multiple Armips patches or merging codebases for ROM hacking projects, embedded firmware, or low-level ARM assembly development.
+
+**ArmipsOrgOverlapFinder** is a utility for detecting overlapping `.org` memory regions in **Armips** assembly projects. It helps ROM hackers, retro game developers, and embedded engineers catch memory collisions early by analyzing `.asm`, `.s`, and `.inc` files, evaluating symbols, and heuristically resolving `.org` directives.
+
+---
+
+## Features
+
+- Fully compatible with **Armips** syntax.
+- Recursively scans multiple directories and follows `.include` directives.
+- Builds a symbol table from `NAME equ EXPR`:
+  - Supports hex (`$NN`, `0xNN`, `NNh`) and decimal numbers.
+- Evaluates simple expressions using `+` and `-` with symbols.
+- Parses and resolves `.org` directives numerically, symbolically, or via heuristics.
+- Detects overlaps between regions across directories within a configurable tolerance.
+- Reports unresolved labels with hints for manual resolution.
+
+---
+
+## Installation
+
+Compile with the C# compiler:
+
+```bash
+csc OrgOverlapFinder_advanced.cs
