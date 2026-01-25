@@ -23,21 +23,50 @@ Features:
 
 class OrgEntry
 {
-    public strin?g FilePath;
+    public string? FilePath;
     public int Line;
     public bool HasValue;
     public uint Address;
     public string RawToken = "";
     public string Hint = "";
 }
+static class Writers
+{
+    public static void WriteA(string text)
+    {
+        var old = Console.ForegroundColor;
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine(text);
+        Console.ForegroundColor = old;
+    }
 
+    public static void WriteB(string text)
+    {
+        var old = Console.ForegroundColor;
+        Console.ForegroundColor = ConsoleColor.Blue;
+        Console.WriteLine(text);
+        Console.ForegroundColor = old;
+    }
+
+    public static void WriteWarn(string text)
+    {
+        var old = Console.ForegroundColor;
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine(text);
+        Console.ForegroundColor = old;
+    }
+}
 class SymbolTable
 {
     Dictionary<string, long> map = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
     Dictionary<string, string> pendingExpr = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
     static Regex equRegex = new Regex(@"^\s*([A-Za-z_\.@][A-Za-z0-9_\.@]*)\s+equ\s+(.+)$", RegexOptions.IgnoreCase);
-
+    public void AddResolved(string name, long value)
+    {
+        map[name] = value;
+        pendingExpr.Remove(name);
+    }
     public void AddOrQueue(string line)
     {
         var m = equRegex.Match(line);
@@ -99,8 +128,13 @@ class SymbolTable
             replaced = Regex.Replace(replaced, @"([0-9A-Fa-f]+)h\b", "0x$1");    // 1234h -> 0x1234
             replaced = Regex.Replace(replaced, @"\$(0*[0-9A-Fa-f]+)", "0x$1");   // $ABCD -> 0xABCD
 
-            // Now reject if identifiers remain (can't evaluate)
-            if (Regex.IsMatch(replaced, @"[A-Za-z_@\.]")) return false;
+            // Reject only if *symbol identifiers* remain (not hex literals)
+            if (Regex.IsMatch(replaced, @"\b[A-Za-z_@\.][A-Za-z0-9_@\.]*\b"))
+            {
+                // allow 0x... hex literals
+                if (!Regex.IsMatch(replaced, @"0x[0-9A-Fa-f]+"))
+                    return false;
+            }
 
             // Evaluate simple arithmetic supporting + and - and parentheses
             result = EvaluateSimpleExpression(replaced);
@@ -213,8 +247,48 @@ class SymbolTable
     {
         if (pendingExpr.Count > 0)
         {
-            Console.WriteLine("Unresolved equ entries:");
+            Writers.WriteWarn("Unresolved equ entries:");
             foreach (var kv in pendingExpr) Console.WriteLine($"  {kv.Key} = {kv.Value}");
+            Writers.WriteWarn("Unresolved equ entries finished.")
+        }
+    }
+}
+static class ExternalSymbolReaders
+{
+    static Regex symLine1 =
+        new Regex(@"^\s*([0-9A-Fa-f]+)\s+([A-Za-z_@\.][A-Za-z0-9_@\.]*)");
+
+    static Regex symLine2 =
+        new Regex(@"^\s*([A-Za-z_@\.][A-Za-z0-9_@\.]*)\s*=\s*([0-9A-Fa-f]+)");
+
+    public static void LoadSymFile(string path, SymbolTable symtab)
+    {
+        foreach (var line in File.ReadAllLines(path))
+        {
+            Match m;
+            if ((m = symLine1.Match(line)).Success ||
+                (m = symLine2.Match(line)).Success)
+            {
+                string name = m.Groups[2].Value;
+                string val = m.Groups[1].Value;
+                if (SymbolTable.TryParseNumber(val, out long addr))
+                    symtab.AddResolved(name, addr);
+            }
+        }
+    }
+
+    public static void LoadMapFile(string path, SymbolTable symtab)
+    {
+        foreach (var line in File.ReadAllLines(path))
+        {
+            var parts = line.Split(new[] { ' ', '\t' },
+                                   StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2) continue;
+
+            if (SymbolTable.TryParseNumber(parts[0], out long addr))
+                symtab.AddResolved(parts[1], addr);
+            else if (SymbolTable.TryParseNumber(parts[1], out addr))
+                symtab.AddResolved(parts[0], addr);
         }
     }
 }
@@ -233,31 +307,55 @@ class Program
     static Regex dataHalfRegex = new Regex(@"^\s*(?:\.hword|\.half)\b", RegexOptions.IgnoreCase);
     static Regex dataWordRegex = new Regex(@"^\s*(?:\.word|\.4byte)\b", RegexOptions.IgnoreCase);
     static Regex dataAsciiRegex = new Regex(@"^\s*(?:\.ascii|\.asciz|\.string)\b", RegexOptions.IgnoreCase);
-
+    static Regex definelabelRegex =
+    new Regex(@"^\s*\.definelabel\s+([A-Za-z_\.@][A-Za-z0-9_\.@]*)\s*,\s*([A-Za-z0-9_\.@+\-]+)",
+              RegexOptions.IgnoreCase);
     static SymbolTable symtab = new SymbolTable();
     static List<string> allFiles = new List<string>();
     static HashSet<string> visitedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
+    static List<string> CollectExtraFiles(string[] args, string flag)
+    {
+        var list = new List<string>();
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i].Equals(flag, StringComparison.OrdinalIgnoreCase))
+            {
+                for (int j = i + 1; j < args.Length && !args[j].StartsWith("--"); j++)
+                    list.Add(args[j]);
+            }
+        }
+        return list;
+    }
     static void Main(string[] args)
     {
-        if (args.Length != 2) { Console.WriteLine("Usage: OrgOverlapFinder_advanced <folderA> <folderB>"); return; }
+        if (args.Length < 2)
+        {
+            Console.WriteLine("Usage: OrgOverlapFinder <folderA> <folderB> [--extraA files...] [--extraB files...]");
+            return;
+        }
+
         string folderA = args[0];
         string folderB = args[1];
-
+        var extraA = CollectExtraFiles(args, "--extraA");
+        var extraB = CollectExtraFiles(args, "--extraB");
         // Build file graph by scanning both folders and following includes.
         CollectFilesWithIncludes(folderA);
         CollectFilesWithIncludes(folderB);
 
         Console.WriteLine($"Collected {allFiles.Count} files (including resolved .includes).");
-
-        // First pass: collect equ definitions (and queue unresolved expressions)
-        foreach (var f in allFiles)
+        foreach (var f in extraA.Concat(extraB))
         {
-            foreach (var line in File.ReadAllLines(f))
-            {
-                symtab.AddOrQueue(line);
-            }
+            if (!File.Exists(f)) continue;
+
+            if (f.EndsWith(".sym", StringComparison.OrdinalIgnoreCase))
+                ExternalSymbolReaders.LoadSymFile(f, symtab);
+            else if (f.EndsWith(".map", StringComparison.OrdinalIgnoreCase))
+                ExternalSymbolReaders.LoadMapFile(f, symtab);
+            else if (f.EndsWith(".inc", StringComparison.OrdinalIgnoreCase))
+                foreach (var line in File.ReadAllLines(f))
+                    symtab.AddOrQueue(line);
         }
+       
         symtab.ResolveAll();
         symtab.DumpPending();
 
@@ -418,6 +516,15 @@ class Program
                     string name = lm.Groups[1].Value;
                     map[name] = i + 1;
                 }
+                if (!lm.Success)
+                {
+                    lm= definelabelRegex.Match(lines[i]);
+                    if (lm.Success)
+                    {
+                        string name = lm.Groups[1].Value;
+                        map[name] = i + 1;
+                    }
+                }
             }
             labelMap[file] = map;
         }
@@ -553,7 +660,7 @@ class Program
         bool any = false;
         foreach (var e in list) if (!e.HasValue) { any = true; break; }
         if (!any) return;
-        Console.WriteLine($"--- UNRESOLVED .org entries ({label}) ---");
+        Writers.WriteWarn($"--- UNRESOLVED .org entries ({label}) ---");
         foreach (var e in list.Where(x => !x.HasValue))
         {
             Console.WriteLine($"{e.FilePath}:{e.Line} token='{e.RawToken}' hint='{e.Hint}'");
@@ -573,8 +680,8 @@ class Program
                 {
                     found++;
                     Console.WriteLine($"Overlap (±{ORG_TOLERANCE}):");
-                    Console.WriteLine($"  A: {a.FilePath}:{a.Line} -> 0x{a.Address:X8} ({a.Hint})");
-                    Console.WriteLine($"  B: {b.FilePath}:{b.Line} -> 0x{b.Address:X8} ({b.Hint})");
+                    Writers.WriteA($"  A: {a.FilePath}:{a.Line} -> 0x{a.Address:X8} ({a.Hint})");
+                    Writers.WriteB($"  B: {b.FilePath}:{b.Line} -> 0x{b.Address:X8} ({b.Hint})");
                     Console.WriteLine();
                 }
             }
