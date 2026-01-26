@@ -428,6 +428,8 @@ class Program
 
     static void Main(string[] args)
     {
+        string? patchA=null;
+        string? patchB = null;
         if (args.Length < 2)
         {
             Console.WriteLine("Usage: OrgOverlapFinder <folderA> <folderB> [--extraA files...] [--extraB files...] [--source-rom][--builtA-rom][--builtB-rom]");
@@ -452,15 +454,16 @@ class Program
             if (args[i].Equals("--builtB-rom", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
                 builtRomBPath = args[++i];
         }
-        string? patchA;
-        string? patchB;
+
         if(sourceRomPath != null && builtRomAPath != null)
         {
             patchA= ExternalIPSReader.RunFlips(sourceRomPath, builtRomAPath, "A");
+            extraA.Add(patchA);
         }
         if (sourceRomPath != null && builtRomBPath != null)
         {
             patchB=ExternalIPSReader.RunFlips(sourceRomPath, builtRomBPath, "B");
+            extraB.Add(patchB);
         }
 
         Console.WriteLine($"Collected {allFiles.Count} files (including resolved .includes).");
@@ -516,6 +519,16 @@ class Program
         // Find overlaps
         FindOverlaps(entriesA, entriesB);
 
+        if(patchA != null)
+        {
+            File.Delete(patchA);
+
+        }
+        if (patchB != null)
+        {
+            File.Delete(patchB);
+
+        }
         Console.WriteLine("Done.");
     }
 
