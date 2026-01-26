@@ -3,6 +3,7 @@ using System.IO;
 using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Linq;
+using System.Formats.Asn1;
 
 /*
 OrgOverlapFinder_advanced.cs
@@ -21,42 +22,179 @@ Features:
  - Reports overlaps within ORG_TOLERANCE (20 bytes default)
 */
 
-class OrgEntry
+public static class ExternalIPSReader
 {
-    public string? FilePath;
-    public int Line;
-    public bool HasValue;
-    public uint Address;
-    public string RawToken = "";
-    public string Hint = "";
-}
-static class Writers
-{
-    public static void WriteA(string text)
+  public  static string RunFlips(string sourceRom, string builtRom, string tag)
     {
-        var old = Console.ForegroundColor;
-        Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine(text);
-        Console.ForegroundColor = old;
+        string flipsExe = Path.Combine("tools", "flips.exe");
+        string outPatch = Path.Combine(Path.GetTempPath(), $"auto_patch_{tag}.ips");
+
+        if (!File.Exists(flipsExe))
+        {
+            Console.WriteLine($"Error: flips.exe not found at {flipsExe}");
+            return "";
+        }
+
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = flipsExe,
+                Arguments = $"--create \"{sourceRom}\" \"{builtRom}\" \"{outPatch}\"",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            var p = System.Diagnostics.Process.Start(psi);
+            p.WaitForExit();
+            Console.WriteLine($"Generated IPS: {outPatch}");
+            return outPatch;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to run flips ({tag}): {ex.Message}");
+            return "";
+        }
     }
 
-    public static void WriteB(string text)
+    class IPSPatch
     {
-        var old = Console.ForegroundColor;
-        Console.ForegroundColor = ConsoleColor.Blue;
-        Console.WriteLine(text);
-        Console.ForegroundColor = old;
+        public uint Offset;
+        public int Size;
+        public string Type; // "NORMAL" or "RLE"
     }
 
-    public static void WriteWarn(string text)
+    public static void LoadIPSFile(string path, SymbolTable symtab)
     {
-        var old = Console.ForegroundColor;
-        Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine(text);
-        Console.ForegroundColor = old;
+        if (!File.Exists(path)) return;
+
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+        using var br = new BinaryReader(fs);
+
+        // Check header
+        var header = br.ReadBytes(5);
+        if (System.Text.Encoding.ASCII.GetString(header) != "PATCH")
+        {
+            Console.WriteLine($"Skipping invalid IPS file: {path}");
+            return;
+        }
+
+        var patches = new List<IPSPatch>();
+
+        while (true)
+        {
+            // Read 3-byte offset or EOF
+            byte[] offsetBytes = br.ReadBytes(3);
+            if (offsetBytes.Length < 3) break;
+            if (offsetBytes[0] == (byte)'E' && offsetBytes[1] == (byte)'O' && offsetBytes[2] == (byte)'F')
+                break;
+
+            uint offset = (uint)((offsetBytes[0] << 16) | (offsetBytes[1] << 8) | offsetBytes[2]);
+
+            // Read 2-byte size
+            byte[] sizeBytes = br.ReadBytes(2);
+            if (sizeBytes.Length < 2) break;
+            int size = (sizeBytes[0] << 8) | sizeBytes[1];
+
+            if (size == 0)
+            {
+                // RLE record
+                byte[] rleSizeBytes = br.ReadBytes(2);
+                if (rleSizeBytes.Length < 2) break;
+                int rleSize = (rleSizeBytes[0] << 8) | rleSizeBytes[1];
+                br.ReadByte(); // RLE value (ignore)
+
+                patches.Add(new IPSPatch
+                {
+                    Offset = offset,
+                    Size = rleSize,
+                    Type = "RLE"
+                });
+            }
+            else
+            {
+                // Normal patch
+                br.ReadBytes(size); // skip actual data
+                patches.Add(new IPSPatch
+                {
+                    Offset = offset,
+                    Size = size,
+                    Type = "NORMAL"
+                });
+            }
+        }
+
+        // Add each patch as a "symbol" in the symbol table
+        foreach (var p in patches)
+        {
+            uint realOffset = PlatformTools.GetOffset(p.Offset, OverlapConfig.Platform);
+            string name = $"IPS_{Path.GetFileNameWithoutExtension(path)}_{realOffset:X8}";
+            long addr = realOffset;
+            symtab.AddResolved(name, addr);
+            // Optional: store size as part of hint
+            Console.WriteLine($"Added IPS patch: {name} @ 0x{addr:X6} size={p.Size} ({p.Type})");
+        }
     }
 }
-class SymbolTable
+
+static class ExternalSymbolReaders
+{
+    static Regex symLine1 =
+        new Regex(@"^\s*([0-9A-Fa-f]+)\s+([A-Za-z_@\.][A-Za-z0-9_@\.]*)");
+
+    static Regex symLine2 =
+        new Regex(@"^\s*([A-Za-z_@\.][A-Za-z0-9_@\.]*)\s*=\s*([0-9A-Fa-f]+)");
+
+    public static void LoadSymFile(string path, SymbolTable symtab)
+    {
+        var ls = File.ReadAllLines(path);
+        for (int i = 0; i < ls.Count(); i++)
+        {
+            string line = ls[i];
+            Match m;
+            if ((m = symLine1.Match(line)).Success ||
+                (m = symLine2.Match(line)).Success)
+            {
+                string name = m.Groups[2].Value;
+                string val = m.Groups[1].Value;
+                if (SymbolTable.TryParseNumber(val, out long addr))
+                    symtab.AddResolved(name, addr);
+            }
+        }
+    }
+
+    public static void LoadMapFile(string path, SymbolTable symtab)
+    {
+        foreach (var line in File.ReadAllLines(path))
+        {
+            var parts = line.Split(new[] { ' ', '\t' },
+                                   StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2) continue;
+
+            if (SymbolTable.TryParseNumber(parts[0], out long addr))
+                symtab.AddResolved(parts[1], addr);
+            else if (SymbolTable.TryParseNumber(parts[1], out addr))
+                symtab.AddResolved(parts[0], addr);
+        }
+    }
+}
+
+public static class RegexTypes
+{
+    public static Regex includeRegex = new Regex(@"^\s*\.include\s+[""']?([^""'\s]+)[""']?", RegexOptions.IgnoreCase);
+    public static Regex orgRegex = new Regex(@"\.org\s+([^\s;#]+)?", RegexOptions.IgnoreCase);
+    public static Regex labelRegex = new Regex(@"^\s*([A-Za-z_\.\@\@][A-Za-z0-9_\.\@\@]*):\s*$");
+    public static Regex incbinRegex = new Regex(@"\.incbin\s+""[^""]+""(?:\s*,\s*(\$?[0-9A-Fa-fx]+))?(?:\s*,\s*(\$?[0-9A-Fa-fx]+))?", RegexOptions.IgnoreCase);
+    public static Regex dataByteRegex = new Regex(@"^\s*(?:\.byte|\.db)\b", RegexOptions.IgnoreCase);
+    public static Regex dataHalfRegex = new Regex(@"^\s*(?:\.hword|\.half)\b", RegexOptions.IgnoreCase);
+    public static Regex dataWordRegex = new Regex(@"^\s*(?:\.word|\.4byte)\b", RegexOptions.IgnoreCase);
+    public static Regex dataAsciiRegex = new Regex(@"^\s*(?:\.ascii|\.asciz|\.string)\b", RegexOptions.IgnoreCase);
+    public static Regex definelabelRegex = new Regex(@"^\s*\.definelabel\s+([A-Za-z_\.@][A-Za-z0-9_\.@]*)\s*,\s*([A-Za-z0-9_\.@+\-]+)",
+              RegexOptions.IgnoreCase);
+}
+
+public class SymbolTable
 {
     Dictionary<string, long> map = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
     Dictionary<string, string> pendingExpr = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -117,7 +255,8 @@ class SymbolTable
         {
             // Replace token symbols with numeric values if available.
             // Use regex to find identifiers and replace when possible.
-            string replaced = Regex.Replace(expr, @"([A-Za-z_@\.][A-Za-z0-9_@\.]*)", m => {
+            string replaced = Regex.Replace(expr, @"([A-Za-z_@\.][A-Za-z0-9_@\.]*)", m =>
+            {
                 string t = m.Value;
                 if (map.TryGetValue(t, out long v)) return v.ToString();
                 return t; // keep as-is if unknown
@@ -247,69 +386,28 @@ class SymbolTable
     {
         if (pendingExpr.Count > 0)
         {
-            Writers.WriteWarn("Unresolved equ entries:");
+            WriteHelpers.WriteWarn("Unresolved equ entries:");
             foreach (var kv in pendingExpr) Console.WriteLine($"  {kv.Key} = {kv.Value}");
-            Writers.WriteWarn("Unresolved equ entries finished.")
+            WriteHelpers.WriteWarn("Unresolved equ entries finished.");
         }
     }
 }
-static class ExternalSymbolReaders
+
+class OrgEntry
 {
-    static Regex symLine1 =
-        new Regex(@"^\s*([0-9A-Fa-f]+)\s+([A-Za-z_@\.][A-Za-z0-9_@\.]*)");
-
-    static Regex symLine2 =
-        new Regex(@"^\s*([A-Za-z_@\.][A-Za-z0-9_@\.]*)\s*=\s*([0-9A-Fa-f]+)");
-
-    public static void LoadSymFile(string path, SymbolTable symtab)
-    {
-        foreach (var line in File.ReadAllLines(path))
-        {
-            Match m;
-            if ((m = symLine1.Match(line)).Success ||
-                (m = symLine2.Match(line)).Success)
-            {
-                string name = m.Groups[2].Value;
-                string val = m.Groups[1].Value;
-                if (SymbolTable.TryParseNumber(val, out long addr))
-                    symtab.AddResolved(name, addr);
-            }
-        }
-    }
-
-    public static void LoadMapFile(string path, SymbolTable symtab)
-    {
-        foreach (var line in File.ReadAllLines(path))
-        {
-            var parts = line.Split(new[] { ' ', '\t' },
-                                   StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 2) continue;
-
-            if (SymbolTable.TryParseNumber(parts[0], out long addr))
-                symtab.AddResolved(parts[1], addr);
-            else if (SymbolTable.TryParseNumber(parts[1], out addr))
-                symtab.AddResolved(parts[0], addr);
-        }
-    }
+    public string? FilePath;
+    public int Line;
+    public bool HasValue;
+    public uint Address;
+    public string RawToken = "";
+    public string Hint = "";
+    public uint size;
 }
-
 
 class Program
 {
     const int ORG_TOLERANCE = 20;
     const int AVG_BYTES_PER_LINE = 4;
-
-    static Regex includeRegex = new Regex(@"^\s*\.include\s+[""']?([^""'\s]+)[""']?", RegexOptions.IgnoreCase);
-    static Regex orgRegex = new Regex(@"\.org\s+([^\s;#]+)?", RegexOptions.IgnoreCase);
-    static Regex labelRegex = new Regex(@"^\s*([A-Za-z_\.\@\@][A-Za-z0-9_\.\@\@]*):\s*$");
-    static Regex incbinRegex = new Regex(@"\.incbin\s+""[^""]+""(?:\s*,\s*(\$?[0-9A-Fa-fx]+))?(?:\s*,\s*(\$?[0-9A-Fa-fx]+))?", RegexOptions.IgnoreCase);
-    static Regex dataByteRegex = new Regex(@"^\s*(?:\.byte|\.db)\b", RegexOptions.IgnoreCase);
-    static Regex dataHalfRegex = new Regex(@"^\s*(?:\.hword|\.half)\b", RegexOptions.IgnoreCase);
-    static Regex dataWordRegex = new Regex(@"^\s*(?:\.word|\.4byte)\b", RegexOptions.IgnoreCase);
-    static Regex dataAsciiRegex = new Regex(@"^\s*(?:\.ascii|\.asciz|\.string)\b", RegexOptions.IgnoreCase);
-    static Regex definelabelRegex =
-    new Regex(@"^\s*\.definelabel\s+([A-Za-z_\.@][A-Za-z0-9_\.@]*)\s*,\s*([A-Za-z0-9_\.@+\-]+)",
-              RegexOptions.IgnoreCase);
     static SymbolTable symtab = new SymbolTable();
     static List<string> allFiles = new List<string>();
     static HashSet<string> visitedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -326,14 +424,18 @@ class Program
         }
         return list;
     }
+
+
     static void Main(string[] args)
     {
         if (args.Length < 2)
         {
-            Console.WriteLine("Usage: OrgOverlapFinder <folderA> <folderB> [--extraA files...] [--extraB files...]");
+            Console.WriteLine("Usage: OrgOverlapFinder <folderA> <folderB> [--extraA files...] [--extraB files...] [--source-rom][--builtA-rom][--builtB-rom]");
             return;
         }
-
+        string? sourceRomPath = null;
+        string? builtRomAPath = null;
+        string? builtRomBPath = null;
         string folderA = args[0];
         string folderB = args[1];
         var extraA = CollectExtraFiles(args, "--extraA");
@@ -341,6 +443,25 @@ class Program
         // Build file graph by scanning both folders and following includes.
         CollectFilesWithIncludes(folderA);
         CollectFilesWithIncludes(folderB);
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i].Equals("--source-rom", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                sourceRomPath = args[++i];
+            if (args[i].Equals("--builtA-rom", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                builtRomAPath = args[++i];
+            if (args[i].Equals("--builtB-rom", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                builtRomBPath = args[++i];
+        }
+        string? patchA;
+        string? patchB;
+        if(sourceRomPath != null && builtRomAPath != null)
+        {
+            patchA= ExternalIPSReader.RunFlips(sourceRomPath, builtRomAPath, "A");
+        }
+        if (sourceRomPath != null && builtRomBPath != null)
+        {
+            patchB=ExternalIPSReader.RunFlips(sourceRomPath, builtRomBPath, "B");
+        }
 
         Console.WriteLine($"Collected {allFiles.Count} files (including resolved .includes).");
         foreach (var f in extraA.Concat(extraB))
@@ -349,13 +470,15 @@ class Program
 
             if (f.EndsWith(".sym", StringComparison.OrdinalIgnoreCase))
                 ExternalSymbolReaders.LoadSymFile(f, symtab);
+            else if (f.EndsWith(".ips", StringComparison.OrdinalIgnoreCase))
+                ExternalIPSReader.LoadIPSFile(f, symtab);
             else if (f.EndsWith(".map", StringComparison.OrdinalIgnoreCase))
                 ExternalSymbolReaders.LoadMapFile(f, symtab);
             else if (f.EndsWith(".inc", StringComparison.OrdinalIgnoreCase))
                 foreach (var line in File.ReadAllLines(f))
                     symtab.AddOrQueue(line);
         }
-       
+
         symtab.ResolveAll();
         symtab.DumpPending();
 
@@ -421,7 +544,7 @@ class Program
             try { lines = File.ReadAllLines(f); } catch { continue; }
             foreach (var line in lines)
             {
-                var m = includeRegex.Match(line);
+                var m = RegexTypes.includeRegex.Match(line);
                 if (m.Success)
                 {
                     string includePath = m.Groups[1].Value.Trim().Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
@@ -465,7 +588,7 @@ class Program
         try { lines = File.ReadAllLines(path); } catch { return results; }
         for (int i = 0; i < lines.Length; i++)
         {
-            var m = orgRegex.Match(lines[i]);
+            var m = RegexTypes.orgRegex.Match(lines[i]);
             if (m.Success)
             {
                 string token = m.Groups[1].Success ? m.Groups[1].Value.Trim() : "";
@@ -510,7 +633,7 @@ class Program
             var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < lines.Length; i++)
             {
-                var lm = labelRegex.Match(lines[i]);
+                var lm = RegexTypes.labelRegex.Match(lines[i]);
                 if (lm.Success)
                 {
                     string name = lm.Groups[1].Value;
@@ -518,7 +641,7 @@ class Program
                 }
                 if (!lm.Success)
                 {
-                    lm= definelabelRegex.Match(lines[i]);
+                    lm = RegexTypes.definelabelRegex.Match(lines[i]);
                     if (lm.Success)
                     {
                         string name = lm.Groups[1].Value;
@@ -618,7 +741,7 @@ class Program
         {
             string l = lines[i].Trim();
             if (string.IsNullOrEmpty(l) || l.StartsWith(";") || l.StartsWith("#")) continue;
-            var mInc = incbinRegex.Match(l);
+            var mInc = RegexTypes.incbinRegex.Match(l);
             if (mInc.Success)
             {
                 // try capture an explicit length (third arg)
@@ -635,14 +758,14 @@ class Program
                 addr += AVG_BYTES_PER_LINE;
                 continue;
             }
-            if (dataByteRegex.IsMatch(l))
+            if (RegexTypes.dataByteRegex.IsMatch(l))
             {
                 int c = l.Count(ch => ch == ',') + 1;
                 addr += (uint)c; continue;
             }
-            if (dataHalfRegex.IsMatch(l)) { int c = l.Count(ch => ch == ',') + 1; addr += (uint)(c * 2); continue; }
-            if (dataWordRegex.IsMatch(l)) { int c = l.Count(ch => ch == ',') + 1; addr += (uint)(c * 4); continue; }
-            if (dataAsciiRegex.IsMatch(l))
+            if (RegexTypes.dataHalfRegex.IsMatch(l)) { int c = l.Count(ch => ch == ',') + 1; addr += (uint)(c * 2); continue; }
+            if (RegexTypes.dataWordRegex.IsMatch(l)) { int c = l.Count(ch => ch == ',') + 1; addr += (uint)(c * 4); continue; }
+            if (RegexTypes.dataAsciiRegex.IsMatch(l))
             {
                 var m = Regex.Match(l, "\"([^\"]*)\"");
                 if (m.Success) addr += (uint)m.Groups[1].Value.Length;
@@ -660,7 +783,7 @@ class Program
         bool any = false;
         foreach (var e in list) if (!e.HasValue) { any = true; break; }
         if (!any) return;
-        Writers.WriteWarn($"--- UNRESOLVED .org entries ({label}) ---");
+        WriteHelpers.WriteWarn($"--- UNRESOLVED .org entries ({label}) ---");
         foreach (var e in list.Where(x => !x.HasValue))
         {
             Console.WriteLine($"{e.FilePath}:{e.Line} token='{e.RawToken}' hint='{e.Hint}'");
@@ -669,6 +792,10 @@ class Program
 
     static void FindOverlaps(List<OrgEntry> A, List<OrgEntry> B)
     {
+        //if (OverlapConfig.WriteToCsv)
+        //{
+        //    File.Delete("Findings.csv");
+        //}
         Console.WriteLine("--- Checking overlaps ---");
         int found = 0;
         foreach (var a in A.Where(x => x.HasValue))
@@ -680,8 +807,8 @@ class Program
                 {
                     found++;
                     Console.WriteLine($"Overlap (±{ORG_TOLERANCE}):");
-                    Writers.WriteA($"  A: {a.FilePath}:{a.Line} -> 0x{a.Address:X8} ({a.Hint})");
-                    Writers.WriteB($"  B: {b.FilePath}:{b.Line} -> 0x{b.Address:X8} ({b.Hint})");
+                    WriteHelpers.WriteA($"  A: {a.FilePath}:{a.Line} -> 0x{a.Address:X8} ({a.Hint})");
+                    WriteHelpers.WriteB($"  B: {b.FilePath}:{b.Line} -> 0x{b.Address:X8} ({b.Hint})");
                     Console.WriteLine();
                 }
             }
