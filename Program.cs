@@ -4,6 +4,7 @@ using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Linq;
 using System.Formats.Asn1;
+using System.Text.Json.Serialization;
 
 /*
 OrgOverlapFinder_advanced.cs
@@ -22,9 +23,47 @@ Features:
  - Reports overlaps within ORG_TOLERANCE (20 bytes default)
 */
 
+
+public static class Overrides
+{
+    public static Dictionary<string, string> Dict {
+        get 
+        {
+            if(_dict == null)
+            {
+                if (File.Exists("OverRideConfig.cfg"))
+                {
+                    string cfgstr = File.ReadAllText("OverRideConfig.cfg");
+                    _dict = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, string>>(cfgstr);
+
+                }
+                else
+                {
+                    _dict = new Dictionary<string, string>();
+                    _dict["reserve_pointer"] = ".dd";
+                    File.WriteAllText("OverRideConfig.cfg", Newtonsoft.Json.JsonConvert.SerializeObject(_dict));
+                }
+            }
+
+            return _dict;
+        }
+    
+    }
+
+    private static Dictionary<string, string> _dict = null;
+    public static void GetCommand(string command, out string result)
+    {
+        result = "";
+        if (_dict.ContainsKey(command))
+        {
+            result=_dict[command];
+        }
+        
+    }
+}
 public static class ExternalIPSReader
 {
-  public  static string RunFlips(string sourceRom, string builtRom, string tag)
+    public static string RunFlips(string sourceRom, string builtRom, string tag)
     {
         string flipsExe = Path.Combine("tools", "flips.exe");
         string outPatch = Path.Combine(Path.GetTempPath(), $"auto_patch_{tag}.ips");
@@ -192,6 +231,9 @@ public static class RegexTypes
     public static Regex dataAsciiRegex = new Regex(@"^\s*(?:\.ascii|\.asciz|\.string)\b", RegexOptions.IgnoreCase);
     public static Regex definelabelRegex = new Regex(@"^\s*\.definelabel\s+([A-Za-z_\.@][A-Za-z0-9_\.@]*)\s*,\s*([A-Za-z0-9_\.@+\-]+)",
               RegexOptions.IgnoreCase);
+    public static Regex defineRegex = new Regex(@"^\s*\.definelabel\s+([A-Za-z_\.@][A-Za-z0-9_\.@]*)\s*,\s*([A-Za-z0-9_\.@+\-]+)",
+          RegexOptions.IgnoreCase);
+    public static Regex equRegex = new Regex(@"^\s*([A-Za-z_\.@][A-Za-z0-9_\.@]*)\s+equ\s+(.+)$", RegexOptions.IgnoreCase);
     public static Regex cDefineRegex =
         new Regex(
             @"^\s*#define\s+([A-Za-z_][A-Za-z0-9_]*)\s+(.+?)\s*(?://.*)?$",
@@ -205,16 +247,32 @@ public class SymbolTable
     Dictionary<string, long> map = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
     Dictionary<string, string> pendingExpr = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-    static Regex equRegex = new Regex(@"^\s*([A-Za-z_\.@][A-Za-z0-9_\.@]*)\s+equ\s+(.+)$", RegexOptions.IgnoreCase);
+
     public void AddResolved(string name, long value)
     {
         map[name] = value;
         pendingExpr.Remove(name);
     }
+
     public void AddOrQueue(string line)
     {
-        var m = equRegex.Match(line);
-        if (!m.Success) return;
+        //if (line.Contains(".define"))
+        //{
+        //    Console.WriteLine();
+        //}
+        var m = RegexTypes.equRegex.Match(line);
+        if (!m.Success)
+        {
+            m = RegexTypes.definelabelRegex.Match(line);
+            if (!m.Success)
+            {
+                m = RegexTypes.defineRegex.Match(line);
+                if (!m.Success)
+                {
+                    return;
+                }
+            }
+        }
         string name = m.Groups[1].Value.Trim();
         string expr = m.Groups[2].Value.Trim();
         // Keep expression form for later evaluation
@@ -451,11 +509,11 @@ class Program
 
     static void Main(string[] args)
     {
-        string? patchA=null;
+        string? patchA = null;
         string? patchB = null;
         if (args.Length < 2)
         {
-            Console.WriteLine("Usage: OrgOverlapFinder <folderA> <folderB> [--extraA files...] [--extraB files...] [--source-rom] [--builtA-rom] [--builtB-rom]");
+            Console.WriteLine("Usage: OrgOverlapFinder <folderA> <folderB> [--extraA files...] [--extraB files...] [--source-rom] [--builtA-rom] [--builtB-rom] [--c-sourceA] [--c-sourceB]");
             return;
         }
         string? sourceRomPath = null;
@@ -466,8 +524,8 @@ class Program
         var extraA = CollectExtraFiles(args, "--extraA");
         var extraB = CollectExtraFiles(args, "--extraB");
         // Build file graph by scanning both folders and following includes.
-        CollectFilesWithIncludes(folderA);
-        CollectFilesWithIncludes(folderB);
+        CollectFiles(folderA);
+        CollectFiles(folderB);
         string? fileASrc = null;
         string? fileBSrc = null;
         for (int i = 0; i < args.Length; i++)
@@ -481,26 +539,31 @@ class Program
             if (args[i].Equals("--c-sourceA", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
             {
                 fileASrc = args[++i];
+
+
+
             }
             if (args[i].Equals("--c-sourceB", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
             {
                 fileBSrc = args[++i];
+
             }
         }
-        finish here you can't think anymore'
-        if(sourceRomPath != null && builtRomAPath != null)
+
+        if (sourceRomPath != null && builtRomAPath != null)
         {
-            patchA= ExternalIPSReader.RunFlips(sourceRomPath, builtRomAPath, "A");
+            patchA = ExternalIPSReader.RunFlips(sourceRomPath, builtRomAPath, "A");
             extraA.Add(patchA);
         }
         if (sourceRomPath != null && builtRomBPath != null)
         {
-            patchB=ExternalIPSReader.RunFlips(sourceRomPath, builtRomBPath, "B");
+            patchB = ExternalIPSReader.RunFlips(sourceRomPath, builtRomBPath, "B");
             extraB.Add(patchB);
         }
 
         Console.WriteLine($"Collected {allFiles.Count} files (including resolved .includes).");
-        foreach (var f in extraA.Concat(extraB))
+        //Extra files from command line
+        foreach (var f in extraA.Concat(extraB).Concat(allFiles))
         {
             if (!File.Exists(f)) continue;
 
@@ -515,12 +578,17 @@ class Program
             {
                 AddCFile(f);
             }
-            else if (f.EndsWith(".inc", StringComparison.OrdinalIgnoreCase))
+            else if (f.EndsWith(".inc", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".asm", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".s", StringComparison.OrdinalIgnoreCase))
+            {
                 foreach (var line in File.ReadAllLines(f))
+                {
                     symtab.AddOrQueue(line);
+                }
+            }
+
         }
 
-       
+
         symtab.ResolveAll();
         symtab.DumpPending();
 
@@ -558,7 +626,7 @@ class Program
         // Find overlaps
         FindOverlaps(entriesA, entriesB);
 
-        if(patchA != null)
+        if (patchA != null)
         {
             File.Delete(patchA);
 
@@ -591,7 +659,7 @@ class Program
         return true;
     }
 
-    static void CollectFilesWithIncludes(string startFolder)
+    static void CollectFiles(string startFolder)
     {
         // Gather initial files
         var files = Directory.GetFiles(startFolder, "*.*", SearchOption.AllDirectories)
@@ -610,6 +678,7 @@ class Program
             if (!visitedFiles.Contains(full)) { visitedFiles.Add(full); allFiles.Add(full); }
         }
 
+        //Scan for included files.
         while (queue.Count > 0)
         {
             string? f = queue.Dequeue();
@@ -618,7 +687,7 @@ class Program
             try { lines = File.ReadAllLines(f); } catch { continue; }
             foreach (var line in lines)
             {
-                var m = RegexTypes.includeRegex.Match(line);
+                var m = RegexTypes.includeRegex.Match(line); //not supporting C includes for now.
                 if (m.Success)
                 {
                     string includePath = m.Groups[1].Value.Trim().Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
