@@ -192,6 +192,12 @@ public static class RegexTypes
     public static Regex dataAsciiRegex = new Regex(@"^\s*(?:\.ascii|\.asciz|\.string)\b", RegexOptions.IgnoreCase);
     public static Regex definelabelRegex = new Regex(@"^\s*\.definelabel\s+([A-Za-z_\.@][A-Za-z0-9_\.@]*)\s*,\s*([A-Za-z0-9_\.@+\-]+)",
               RegexOptions.IgnoreCase);
+    public static Regex cDefineRegex =
+        new Regex(
+            @"^\s*#define\s+([A-Za-z_][A-Za-z0-9_]*)\s+(.+?)\s*(?://.*)?$",
+            RegexOptions.IgnoreCase
+        );
+
 }
 
 public class SymbolTable
@@ -214,7 +220,24 @@ public class SymbolTable
         // Keep expression form for later evaluation
         pendingExpr[name] = expr;
     }
+    public void AddCDefine(string name, string expr)
+    {
+        // Strip surrounding parentheses if present
+        expr = expr.Trim();
+        if (expr.StartsWith("(") && expr.EndsWith(")"))
+            expr = expr.Substring(1, expr.Length - 2).Trim();
 
+        // Try immediate evaluation
+        if (TryEvalExpression(expr, out long val))
+        {
+            AddResolved(name, val);
+        }
+        else
+        {
+            // Queue for later resolution (like equ)
+            pendingExpr[name] = expr;
+        }
+    }
     // Try to resolve as many pending expressions as possible
     public void ResolveAll()
     {
@@ -432,7 +455,7 @@ class Program
         string? patchB = null;
         if (args.Length < 2)
         {
-            Console.WriteLine("Usage: OrgOverlapFinder <folderA> <folderB> [--extraA files...] [--extraB files...] [--source-rom][--builtA-rom][--builtB-rom]");
+            Console.WriteLine("Usage: OrgOverlapFinder <folderA> <folderB> [--extraA files...] [--extraB files...] [--source-rom] [--builtA-rom] [--builtB-rom]");
             return;
         }
         string? sourceRomPath = null;
@@ -445,6 +468,8 @@ class Program
         // Build file graph by scanning both folders and following includes.
         CollectFilesWithIncludes(folderA);
         CollectFilesWithIncludes(folderB);
+        string? fileASrc = null;
+        string? fileBSrc = null;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i].Equals("--source-rom", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
@@ -453,8 +478,16 @@ class Program
                 builtRomAPath = args[++i];
             if (args[i].Equals("--builtB-rom", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
                 builtRomBPath = args[++i];
+            if (args[i].Equals("--c-sourceA", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+            {
+                fileASrc = args[++i];
+            }
+            if (args[i].Equals("--c-sourceB", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+            {
+                fileBSrc = args[++i];
+            }
         }
-
+        finish here you can't think anymore'
         if(sourceRomPath != null && builtRomAPath != null)
         {
             patchA= ExternalIPSReader.RunFlips(sourceRomPath, builtRomAPath, "A");
@@ -477,11 +510,17 @@ class Program
                 ExternalIPSReader.LoadIPSFile(f, symtab);
             else if (f.EndsWith(".map", StringComparison.OrdinalIgnoreCase))
                 ExternalSymbolReaders.LoadMapFile(f, symtab);
+            else if (f.EndsWith(".c", StringComparison.OrdinalIgnoreCase) ||
+                f.EndsWith(".h", StringComparison.OrdinalIgnoreCase))
+            {
+                AddCFile(f);
+            }
             else if (f.EndsWith(".inc", StringComparison.OrdinalIgnoreCase))
                 foreach (var line in File.ReadAllLines(f))
                     symtab.AddOrQueue(line);
         }
 
+       
         symtab.ResolveAll();
         symtab.DumpPending();
 
@@ -532,13 +571,35 @@ class Program
         Console.WriteLine("Done.");
     }
 
+    private static bool AddCFile(string f)
+    {
+        string[] lines;
+        try { lines = File.ReadAllLines(f); }
+        catch { return false; }
+
+        foreach (var line in lines)
+        {
+            var m = RegexTypes.cDefineRegex.Match(line);
+            if (!m.Success) continue;
+
+            string name = m.Groups[1].Value;
+            string expr = m.Groups[2].Value;
+
+            symtab.AddCDefine(name, expr);
+        }
+
+        return true;
+    }
+
     static void CollectFilesWithIncludes(string startFolder)
     {
         // Gather initial files
         var files = Directory.GetFiles(startFolder, "*.*", SearchOption.AllDirectories)
                     .Where(fn => fn.EndsWith(".asm", StringComparison.OrdinalIgnoreCase)
                               || fn.EndsWith(".s", StringComparison.OrdinalIgnoreCase)
-                              || fn.EndsWith(".inc", StringComparison.OrdinalIgnoreCase))
+                              || fn.EndsWith(".inc", StringComparison.OrdinalIgnoreCase)
+                              || fn.EndsWith(".c", StringComparison.OrdinalIgnoreCase)
+                              || fn.EndsWith(".h", StringComparison.OrdinalIgnoreCase))
                     .ToList();
 
         // We'll process a queue to follow includes
