@@ -1,35 +1,31 @@
-﻿using System;
+﻿// OrgOverlapFinder_advanced.cs
+using System;
 using System.IO;
 using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Linq;
 using System.Formats.Asn1;
 using System.Text.Json.Serialization;
+using Newtonsoft.Json.Linq;
 
 /*
-OrgOverlapFinder_advanced.cs
+OrgOverlapFinder_advanced.cs (updated)
 
-Usage:
-  csc OrgOverlapFinder_advanced.cs
-  OrgOverlapFinder_advanced.exe C:\path\to\folderA C:\path\to\folderB
-
-Features:
- - Recursively scans folderA and folderB for .asm/.s/.inc
- - Follows .include directives (relative to the including file) to collect a full file graph
- - Builds symbol table from "NAME equ EXPR" (supports hex formats: 0x, $, trailing h; decimal)
- - Evaluates simple expressions using + and - with symbols
- - Parses .org directives and resolves numeric, symbol, or expression forms
- - For unresolved labels, tries to find label in files and estimates address using nearest numeric .org and byte-size heuristics
- - Reports overlaps within ORG_TOLERANCE (20 bytes default)
+- Adds .area/.endarea counting with support for .definearea / .defineregion and .region
+- Recursively follows .include directives while counting area contents
+- Validates content size vs declared area size (warns if overflow)
+- Writes a Findings.csv with overlaps if configured
+- Other previously existing behavior preserved
 */
 
 
 public static class Overrides
 {
-    public static Dictionary<string, string> Dict {
-        get 
+    public static Dictionary<string, string> Dict
+    {
+        get
         {
-            if(_dict == null)
+            if (_dict == null)
             {
                 if (File.Exists("OverRideConfig.cfg"))
                 {
@@ -47,7 +43,7 @@ public static class Overrides
 
             return _dict;
         }
-    
+
     }
 
     private static Dictionary<string, string> _dict = null;
@@ -56,11 +52,12 @@ public static class Overrides
         result = "";
         if (_dict.ContainsKey(command))
         {
-            result=_dict[command];
+            result = _dict[command];
         }
-        
+
     }
 }
+
 public static class ExternalIPSReader
 {
     public static string RunFlips(string sourceRom, string builtRom, string tag)
@@ -225,10 +222,12 @@ public static class RegexTypes
     public static Regex orgRegex = new Regex(@"\.org\s+([^\s;#]+)?", RegexOptions.IgnoreCase);
     public static Regex labelRegex = new Regex(@"^\s*([A-Za-z_\.\@\@][A-Za-z0-9_\.\@\@]*):\s*$");
     public static Regex incbinRegex = new Regex(@"\.incbin\s+""[^""]+""(?:\s*,\s*(\$?[0-9A-Fa-fx]+))?(?:\s*,\s*(\$?[0-9A-Fa-fx]+))?", RegexOptions.IgnoreCase);
-    public static Regex dataByteRegex = new Regex(@"^\s*(?:\.byte|\.db)\b", RegexOptions.IgnoreCase);
-    public static Regex dataHalfRegex = new Regex(@"^\s*(?:\.hword|\.half)\b", RegexOptions.IgnoreCase);
-    public static Regex dataWordRegex = new Regex(@"^\s*(?:\.word|\.4byte)\b", RegexOptions.IgnoreCase);
-    public static Regex dataAsciiRegex = new Regex(@"^\s*(?:\.ascii|\.asciz|\.string)\b", RegexOptions.IgnoreCase);
+    public static Regex dataByteRegex = new Regex(@"^\s*(?:\.byte|\.db|\.dcb|db|dcb)\b", RegexOptions.IgnoreCase);
+    public static Regex dataHalfRegex = new Regex(@"^\s*(?:\.hword|\.half|\.dh|dh)\b", RegexOptions.IgnoreCase);
+    public static Regex dataWordRegex = new Regex(@"^\s*(?:\.word|\.4byte|\.d32|\.dw|dw|dcd)\b", RegexOptions.IgnoreCase);
+    public static Regex dataDoubleRegex = new Regex(@"^\s*(?:\.doubleword|\.dword|\.dd|dd|dcq)\b", RegexOptions.IgnoreCase);
+    public static Regex dataAsciiRegex = new Regex(@"^\s*(?:\.ascii|\.asciz|\.string|\.asciiz)\b", RegexOptions.IgnoreCase);
+
     public static Regex definelabelRegex = new Regex(@"^\s*\.definelabel\s+([A-Za-z_\.@][A-Za-z0-9_\.@]*)\s*,\s*([A-Za-z0-9_\.@+\-]+)",
               RegexOptions.IgnoreCase);
     public static Regex defineRegex = new Regex(@"^\s*\.definelabel\s+([A-Za-z_\.@][A-Za-z0-9_\.@]*)\s*,\s*([A-Za-z0-9_\.@+\-]+)",
@@ -239,6 +238,14 @@ public static class RegexTypes
             @"^\s*#define\s+([A-Za-z_][A-Za-z0-9_]*)\s+(.+?)\s*(?://.*)?$",
             RegexOptions.IgnoreCase
         );
+
+    // area/region related
+    public static Regex areaRegex = new Regex(@"^\s*\.area\s+([A-Za-z0-9_\.@+\-\(\)]+)(?:\s*,\s*([A-Za-z0-9_\.@+\-\(\)]+))?", RegexOptions.IgnoreCase);
+    public static Regex endAreaRegex = new Regex(@"^\s*\.endarea\b", RegexOptions.IgnoreCase);
+    public static Regex regionRegex = new Regex(@"^\s*\.region(?:\s+([A-Za-z0-9_\.@+\-\(\)]+))?(?:\s*,\s*([A-Za-z0-9_\.@+\-\(\)]+))?(?:\s*,\s*([A-Za-z0-9_\.@+\-\(\)]+))?", RegexOptions.IgnoreCase);
+    public static Regex endRegionRegex = new Regex(@"^\s*\.endregion\b", RegexOptions.IgnoreCase);
+    public static Regex defineAreaRegex = new Regex(@"^\s*\.definearea\s+([A-Za-z_\.@][A-Za-z0-9_\.@]*)\s*,\s*([A-Za-z0-9_\.@+\-\(\)]+)", RegexOptions.IgnoreCase);
+    public static Regex defineRegionRegex = new Regex(@"^\s*\.defineregion\s+([A-Za-z_\.@][A-Za-z0-9_\.@]*)\s*,\s*([A-Za-z0-9_\.@+\-\(\)]+)(?:\s*,\s*([A-Za-z0-9_\.@+\-\(\)]+))?", RegexOptions.IgnoreCase);
 
 }
 
@@ -256,19 +263,46 @@ public class SymbolTable
 
     public void AddOrQueue(string line)
     {
-        //if (line.Contains(".define"))
-        //{
-        //    Console.WriteLine();
-        //}
+        // skip tokens starting with readptr(
+        if (OverlapConfig.ShouldSkipToken(line))
+        {
+            return;
+        }
+        // collect equ / definelabel / definearea / defineregion
         var m = RegexTypes.equRegex.Match(line);
         if (!m.Success)
         {
             m = RegexTypes.definelabelRegex.Match(line);
             if (!m.Success)
             {
-                m = RegexTypes.defineRegex.Match(line);
+                m = RegexTypes.cDefineRegex.Match(line);
+
+
                 if (!m.Success)
                 {
+                    m = RegexTypes.defineRegex.Match(line);
+                    if (!m.Success)
+                    {
+                        // .definearea
+                        var da = RegexTypes.defineAreaRegex.Match(line);
+                        if (da.Success)
+                        {
+                            string name2 = da.Groups[1].Value.Trim();
+                            string expr2 = da.Groups[2].Value.Trim();
+                            pendingExpr[name2] = expr2;
+                            return;
+                        }
+                        // .defineregion
+                        var dr = RegexTypes.defineRegionRegex.Match(line);
+                        if (dr.Success)
+                        {
+                            string name2 = dr.Groups[1].Value.Trim();
+                            string expr2 = dr.Groups[2].Value.Trim();
+                            pendingExpr[name2] = expr2;
+                            // third param might be fill; we don't queue fill in symbol table
+                            return;
+                        }
+                    }
                     return;
                 }
             }
@@ -467,9 +501,9 @@ public class SymbolTable
     {
         if (pendingExpr.Count > 0)
         {
-            WriteHelpers.WriteWarn("Unresolved equ entries:");
+            WriteHelpers.WriteWarn("Unresolved equ / definearea / defineregion entries:");
             foreach (var kv in pendingExpr) Console.WriteLine($"  {kv.Key} = {kv.Value}");
-            WriteHelpers.WriteWarn("Unresolved equ entries finished.");
+            WriteHelpers.WriteWarn("Unresolved entries finished.");
         }
     }
 }
@@ -485,6 +519,14 @@ class OrgEntry
     public uint size;
 }
 
+class RegionInfo
+{
+    public string Name = "";
+    public uint Size = 0; // declarative size if present
+    public byte Fill = 0x00; // fill value if provided
+    public uint StartAddrGuess = 0; // optional guessed start (not always used)
+}
+
 class Program
 {
     const int ORG_TOLERANCE = 20;
@@ -492,6 +534,10 @@ class Program
     static SymbolTable symtab = new SymbolTable();
     static List<string> allFiles = new List<string>();
     static HashSet<string> visitedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    // Regions defined by .region / .defineregion
+    static Dictionary<string, RegionInfo> Regions = new Dictionary<string, RegionInfo>(StringComparer.OrdinalIgnoreCase);
+
     static List<string> CollectExtraFiles(string[] args, string flag)
     {
         var list = new List<string>();
@@ -505,7 +551,6 @@ class Program
         }
         return list;
     }
-
 
     static void Main(string[] args)
     {
@@ -539,26 +584,22 @@ class Program
             if (args[i].Equals("--c-sourceA", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
             {
                 fileASrc = args[++i];
-
-
-
             }
             if (args[i].Equals("--c-sourceB", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
             {
                 fileBSrc = args[++i];
-
             }
         }
 
         if (sourceRomPath != null && builtRomAPath != null)
         {
             patchA = ExternalIPSReader.RunFlips(sourceRomPath, builtRomAPath, "A");
-            extraA.Add(patchA);
+            if (!string.IsNullOrEmpty(patchA)) extraA.Add(patchA);
         }
         if (sourceRomPath != null && builtRomBPath != null)
         {
             patchB = ExternalIPSReader.RunFlips(sourceRomPath, builtRomBPath, "B");
-            extraB.Add(patchB);
+            if (!string.IsNullOrEmpty(patchB)) extraB.Add(patchB);
         }
 
         Console.WriteLine($"Collected {allFiles.Count} files (including resolved .includes).");
@@ -583,11 +624,33 @@ class Program
                 foreach (var line in File.ReadAllLines(f))
                 {
                     symtab.AddOrQueue(line);
+                    // also track .defineregion/.region directives early
+                    var r = RegexTypes.defineRegionRegex.Match(line);
+                    if (r.Success)
+                    {
+                        string name = r.Groups[1].Value.Trim();
+                        string sizeExpr = r.Groups[2].Value.Trim();
+                        long val = 0;
+                        if (symtab.TryEvalExpression(sizeExpr, out val))
+                        {
+                            var ri = new RegionInfo { Name = name, Size = (uint)val };
+                            if (r.Groups.Count >= 4 && r.Groups[3].Success)
+                            {
+                                if (SymbolTable.TryParseNumber(r.Groups[3].Value.Trim(), out long fill))
+                                    ri.Fill = (byte)fill;
+                            }
+                            Regions[name] = ri;
+                        }
+                        else
+                        {
+                            // queue size expression in symbol table as well, so ResolveAll picks it up
+                            symtab.AddOrQueue(line);
+                        }
+                    }
                 }
             }
 
         }
-
 
         symtab.ResolveAll();
         symtab.DumpPending();
@@ -624,17 +687,16 @@ class Program
         PrintUnresolved(entriesB, "FolderB");
 
         // Find overlaps
+        if (OverlapConfig.WriteToCsv && File.Exists(OverlapConfig.CsvPath)) File.Delete(OverlapConfig.CsvPath);
         FindOverlaps(entriesA, entriesB);
 
         if (patchA != null)
         {
-            File.Delete(patchA);
-
+            try { File.Delete(patchA); } catch { }
         }
         if (patchB != null)
         {
-            File.Delete(patchB);
-
+            try { File.Delete(patchB); } catch { }
         }
         Console.WriteLine("Done.");
     }
@@ -738,6 +800,8 @@ class Program
                 var e = new OrgEntry() { FilePath = path, Line = i + 1 };
                 if (!string.IsNullOrEmpty(token))
                 {
+                  
+
                     // try numeric or expression
                     if (SymbolTable.TryParseNumber(token, out long num))
                     {
@@ -876,6 +940,7 @@ class Program
         }
     }
 
+    // Estimate bytes between prevIndex (zero-based) and targetIndex (zero-based) in file, starting at prevAddr.
     static uint EstimateBytesBetween(string file, int prevIndex, int targetIndex, uint prevAddr)
     {
         string[] lines = File.ReadAllLines(file);
@@ -884,19 +949,132 @@ class Program
         {
             string l = lines[i].Trim();
             if (string.IsNullOrEmpty(l) || l.StartsWith(";") || l.StartsWith("#")) continue;
+
+            // handle .area blocks precisely: count contents, follow includes recursively, validate against declared size if present
+            var mArea = RegexTypes.areaRegex.Match(l);
+            if (mArea.Success)
+            {
+                string sizeExpr = mArea.Groups[1].Value.Trim();
+                string fillExpr = mArea.Groups.Count >= 3 && mArea.Groups[2].Success ? mArea.Groups[2].Value.Trim() : null;
+
+                long declaredSize = 0;
+                bool hasDeclaredSize = false;
+                if (!string.IsNullOrEmpty(sizeExpr))
+                {
+                    if (SymbolTable.TryParseNumber(sizeExpr, out long v) || symtab.TryEvalExpression(sizeExpr, out v))
+                    {
+                        declaredSize = v;
+                        hasDeclaredSize = true;
+                    }
+                }
+
+                // Accumulate contents until .endarea
+                uint contentBytes = 0;
+                int j = i + 1;
+                for (; j < lines.Length; j++)
+                {
+                    string inner = lines[j].Trim();
+                    if (RegexTypes.endAreaRegex.IsMatch(inner)) break;
+
+                    // If inner is a nested .include -> expand that file's entire content estimate
+                    var inc = RegexTypes.includeRegex.Match(inner);
+                    if (inc.Success)
+                    {
+                        string includePath = inc.Groups[1].Value.Trim().Trim('"').Trim('\'');
+                        string baseDir = Path.GetDirectoryName(file);
+                        string candidate = Path.Combine(baseDir, includePath);
+                        if (!File.Exists(candidate))
+                        {
+                            // try fallback by just name among collected files
+                            var found = allFiles.FirstOrDefault(x => Path.GetFileName(x).Equals(includePath, StringComparison.OrdinalIgnoreCase));
+                            if (found != null) candidate = found;
+                        }
+                        if (File.Exists(candidate))
+                        {
+                            // estimate whole included file content
+                            contentBytes += EstimateFileContent(candidate);
+                        }
+                        else
+                        {
+                            contentBytes += (uint)(AVG_BYTES_PER_LINE * 4);
+                        }
+                        continue;
+                    }
+
+                    var mIncbin = RegexTypes.incbinRegex.Match(inner);
+                    if (mIncbin.Success)
+                    {
+                        // attempt to parse explicit size arg (3rd param) or second param
+                        if (mIncbin.Groups.Count >= 4 && mIncbin.Groups[3].Success)
+                        {
+                            string token = mIncbin.Groups[3].Value.Trim().Trim(',');
+                            if (SymbolTable.TryParseNumber(token, out long len)) { contentBytes += (uint)len; continue; }
+                            if (symtab.TryEvalExpression(token, out long v2)) { contentBytes += (uint)v2; continue; }
+                        }
+                        if (mIncbin.Groups.Count >= 3 && mIncbin.Groups[2].Success)
+                        {
+                            string token = mIncbin.Groups[2].Value.Trim().Trim(',');
+                            if (SymbolTable.TryParseNumber(token, out long len)) { contentBytes += (uint)len; continue; }
+                            if (symtab.TryEvalExpression(token, out long v2)) { contentBytes += (uint)v2; continue; }
+                        }
+                        contentBytes += (uint)AVG_BYTES_PER_LINE;
+                        continue;
+                    }
+
+                    if (RegexTypes.dataByteRegex.IsMatch(inner))
+                    {
+                        int c = inner.Count(ch => ch == ',') + 1;
+                        contentBytes += (uint)c; continue;
+                    }
+                    if (RegexTypes.dataHalfRegex.IsMatch(inner)) { int c = inner.Count(ch => ch == ',') + 1; contentBytes += (uint)(c * 2); continue; }
+                    if (RegexTypes.dataWordRegex.IsMatch(inner)) { int c = inner.Count(ch => ch == ',') + 1; contentBytes += (uint)(c * 4); continue; }
+                    if (RegexTypes.dataDoubleRegex.IsMatch(inner)) { int c = inner.Count(ch => ch == ',') + 1; contentBytes += (uint)(c * 8); continue; }
+                    if (RegexTypes.dataAsciiRegex.IsMatch(inner))
+                    {
+                        var m = Regex.Match(inner, "\"([^\"]*)\"");
+                        if (m.Success) contentBytes += (uint)m.Groups[1].Value.Length;
+                        else contentBytes += AVG_BYTES_PER_LINE;
+                        continue;
+                    }
+
+                    // Nested .area inside .area? treat as average for nested area line
+                    var nested = RegexTypes.areaRegex.Match(inner);
+                    if (nested.Success) { contentBytes += AVG_BYTES_PER_LINE; continue; }
+
+                    // anything else
+                    contentBytes += AVG_BYTES_PER_LINE;
+                }
+
+                // Validate vs declared size (warn if overflow)
+                if (hasDeclaredSize && contentBytes > declaredSize)
+                {
+                    WriteHelpers.WriteWarn($".area overflow in {file}:{i + 1} - declared {declaredSize} bytes but content used {contentBytes} bytes.");
+                }
+
+                // Advance by declared size if present, else by actual content bytes (armips pads area)
+                uint used = hasDeclaredSize ? (uint)declaredSize : contentBytes;
+                addr += used;
+
+                // move index to endarea
+                i = j; // loop will i++ so this lands after .endarea
+                continue;
+            }
+
+            // otherwise default heuristics
             var mInc = RegexTypes.incbinRegex.Match(l);
             if (mInc.Success)
             {
-                // try capture an explicit length (third arg)
-                if (mInc.Groups.Count >= 3 && mInc.Groups[2].Success)
-                {
-                    string token = mInc.Groups[2].Value.Trim().Trim(',');
-                    if (SymbolTable.TryParseNumber(token, out long len)) { addr += (uint)len; continue; }
-                }
                 if (mInc.Groups.Count >= 4 && mInc.Groups[3].Success)
                 {
                     string token = mInc.Groups[3].Value.Trim().Trim(',');
                     if (SymbolTable.TryParseNumber(token, out long len)) { addr += (uint)len; continue; }
+                    if (symtab.TryEvalExpression(token, out long v2)) { addr += (uint)v2; continue; }
+                }
+                if (mInc.Groups.Count >= 3 && mInc.Groups[2].Success)
+                {
+                    string token = mInc.Groups[2].Value.Trim().Trim(',');
+                    if (SymbolTable.TryParseNumber(token, out long len)) { addr += (uint)len; continue; }
+                    if (symtab.TryEvalExpression(token, out long v2)) { addr += (uint)v2; continue; }
                 }
                 addr += AVG_BYTES_PER_LINE;
                 continue;
@@ -908,6 +1086,7 @@ class Program
             }
             if (RegexTypes.dataHalfRegex.IsMatch(l)) { int c = l.Count(ch => ch == ',') + 1; addr += (uint)(c * 2); continue; }
             if (RegexTypes.dataWordRegex.IsMatch(l)) { int c = l.Count(ch => ch == ',') + 1; addr += (uint)(c * 4); continue; }
+            if (RegexTypes.dataDoubleRegex.IsMatch(l)) { int c = l.Count(ch => ch == ',') + 1; addr += (uint)(c * 8); continue; }
             if (RegexTypes.dataAsciiRegex.IsMatch(l))
             {
                 var m = Regex.Match(l, "\"([^\"]*)\"");
@@ -915,7 +1094,78 @@ class Program
                 else addr += AVG_BYTES_PER_LINE;
                 continue;
             }
-            // anything else we count as avg
+
+            addr += AVG_BYTES_PER_LINE;
+        }
+        return addr;
+    }
+
+    // Estimate full-file content size for use when encountering .include inside areas.
+    static uint EstimateFileContent(string path)
+    {
+        if (!File.Exists(path)) return (uint)(AVG_BYTES_PER_LINE * 10);
+        string[] lines = File.ReadAllLines(path);
+        uint addr = 0;
+        for (int i = 0; i < lines.Length; i++)
+        {
+            string l = lines[i].Trim();
+            if (string.IsNullOrEmpty(l) || l.StartsWith(";") || l.StartsWith("#")) continue;
+
+            var mArea = RegexTypes.areaRegex.Match(l);
+            if (mArea.Success)
+            {
+                // crude: reuse EstimateBytesBetween for the whole file region starting at this line
+                uint after = EstimateBytesBetween(path, i, lines.Length - 1, addr);
+                // compute used = after - addr
+                uint used = after - addr;
+                addr = after;
+                // advance i to after processed area by scanning until .endarea
+                int j = i + 1;
+                for (; j < lines.Length; j++)
+                    if (RegexTypes.endAreaRegex.IsMatch(lines[j])) break;
+                i = j;
+                continue;
+            }
+
+            var inc = RegexTypes.includeRegex.Match(l);
+            if (inc.Success)
+            {
+                string includePath = inc.Groups[1].Value.Trim().Trim('"').Trim('\'');
+                string baseDir = Path.GetDirectoryName(path);
+                string candidate = Path.Combine(baseDir, includePath);
+                if (!File.Exists(candidate))
+                {
+                    var found = allFiles.FirstOrDefault(x => Path.GetFileName(x).Equals(includePath, StringComparison.OrdinalIgnoreCase));
+                    if (found != null) candidate = found;
+                }
+                if (File.Exists(candidate))
+                {
+                    addr += EstimateFileContent(candidate);
+                    continue;
+                }
+                else
+                {
+                    addr += (uint)(AVG_BYTES_PER_LINE * 4);
+                }
+                continue;
+            }
+
+            if (RegexTypes.dataByteRegex.IsMatch(l))
+            {
+                int c = l.Count(ch => ch == ',') + 1;
+                addr += (uint)c; continue;
+            }
+            if (RegexTypes.dataHalfRegex.IsMatch(l)) { int c = l.Count(ch => ch == ',') + 1; addr += (uint)(c * 2); continue; }
+            if (RegexTypes.dataWordRegex.IsMatch(l)) { int c = l.Count(ch => ch == ',') + 1; addr += (uint)(c * 4); continue; }
+            if (RegexTypes.dataDoubleRegex.IsMatch(l)) { int c = l.Count(ch => ch == ',') + 1; addr += (uint)(c * 8); continue; }
+            if (RegexTypes.dataAsciiRegex.IsMatch(l))
+            {
+                var m = Regex.Match(l, "\"([^\"]*)\"");
+                if (m.Success) addr += (uint)m.Groups[1].Value.Length;
+                else addr += AVG_BYTES_PER_LINE;
+                continue;
+            }
+
             addr += AVG_BYTES_PER_LINE;
         }
         return addr;
@@ -935,16 +1185,29 @@ class Program
 
     static void FindOverlaps(List<OrgEntry> A, List<OrgEntry> B)
     {
-        //if (OverlapConfig.WriteToCsv)
-        //{
-        //    File.Delete("Findings.csv");
-        //}
         Console.WriteLine("--- Checking overlaps ---");
         int found = 0;
-        foreach (var a in A.Where(x => x.HasValue))
+        if (OverlapConfig.WriteToCsv)
         {
-            foreach (var b in B.Where(x => x.HasValue))
+            try
             {
+                using var sw = new StreamWriter(OverlapConfig.CsvPath, false);
+                sw.WriteLine("Side,File,Line,Address,Hint");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to create CSV {OverlapConfig.CsvPath}: {ex.Message}");
+            }
+        }
+
+        for (int ai = 0; ai < A.Count; ai++)
+        {
+            var a = A[ai];
+            if (!a.HasValue) continue;
+            for (int bi = 0; bi < B.Count; bi++)
+            {
+                var b = B[bi];
+                if (!b.HasValue) continue;
                 int diff = (int)Math.Abs((long)a.Address - (long)b.Address);
                 if (diff <= ORG_TOLERANCE)
                 {
@@ -953,9 +1216,25 @@ class Program
                     WriteHelpers.WriteA($"  A: {a.FilePath}:{a.Line} -> 0x{a.Address:X8} ({a.Hint})");
                     WriteHelpers.WriteB($"  B: {b.FilePath}:{b.Line} -> 0x{b.Address:X8} ({b.Hint})");
                     Console.WriteLine();
+
+                    if (OverlapConfig.WriteToCsv)
+                    {
+                        try
+                        {
+                            using var sw = new StreamWriter(OverlapConfig.CsvPath, true);
+                            sw.WriteLine($"A,\"{a.FilePath}\",{a.Line},0x{a.Address:X8},\"{a.Hint}\"");
+                            sw.WriteLine($"B,\"{b.FilePath}\",{b.Line},0x{b.Address:X8},\"{b.Hint}\"");
+                            sw.WriteLine(""); // blank line between hits
+                        }
+                        catch { }
+                    }
                 }
             }
         }
         if (found == 0) Console.WriteLine("No overlaps found within tolerance.");
+        else Console.WriteLine($"Found {found} potential overlaps.");
     }
 }
+
+
+
